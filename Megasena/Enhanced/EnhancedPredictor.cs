@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
@@ -38,7 +39,7 @@ namespace Megasena.Enhanced
             {
                 _inputSize = inputSize;
                 _network = CreateNetwork();
-                _bestNetwork = CreateNetwork(); 
+                _bestNetwork = CreateNetwork();
                 _bestError = double.MaxValue;
             }
 
@@ -46,7 +47,7 @@ namespace Megasena.Enhanced
             /// Cria a estrutura da rede com:
             /// - Camada de entrada: inputSize neurônios
             /// - Camadas ocultas com ReLU
-            /// - Camada de saída: 60 neurônios, Softmax (probabilidade distribuída)
+            /// - Camada de saída: 60 neurônios, Sigmoid (probabilidade independente)
             /// </summary>
             private BasicNetwork CreateNetwork()
             {
@@ -62,8 +63,8 @@ namespace Megasena.Enhanced
                 network.AddLayer(new BasicLayer(new ActivationReLU(), true, _inputSize * 2));
                 network.AddLayer(new BasicLayer(new ActivationReLU(), true, _inputSize));
 
-                // Camada de saída: 60 neurônios, Softmax para distribuição de probabilidade
-                network.AddLayer(new BasicLayer(new ActivationSoftMax(), true, OUTPUT_SIZE));
+                // Camada de saída: 60 neurônios, Sigmoid (probabilidade 0..1)
+                network.AddLayer(new BasicLayer(new ActivationSigmoid(), true, OUTPUT_SIZE));
 
                 network.Structure.FinalizeStructure();
                 network.Reset();
@@ -119,7 +120,7 @@ namespace Megasena.Enhanced
                         break;
 
                     // Log assíncrono para acompanhar o progresso
-                    if (epoch % 1000 == 0)
+                    if (epoch % 100 == 0) // Log a cada 100 épocas
                     {
                         Console.WriteLine($"[Training] Época {epoch}: Erro = {train.Error}");
                     }
@@ -197,7 +198,7 @@ namespace Megasena.Enhanced
             // Colecionamos as features de cada sub-janela em uma lista única
             var combinedFeatures = new List<double>();
 
-            // Paralelizar o processamento das sub-janelas
+            // Processar cada sub-janela em paralelo
             var subFeatures = _subWindows.AsParallel().Select(w =>
             {
                 var wSize = Math.Min(w, mainWindow.Count);
@@ -209,6 +210,7 @@ namespace Megasena.Enhanced
                 return new List<double>(freq).Concat(lastOcc).ToList();
             }).ToList();
 
+            // Combinar todas as features das sub-janelas
             foreach (var sub in subFeatures)
             {
                 combinedFeatures.AddRange(sub);
@@ -234,7 +236,7 @@ namespace Megasena.Enhanced
                 freq[draw.V6 - 1]++;
             }
 
-            // Normaliza pela quantidade de sorteios
+            // Normaliza pela quantidade de sorteios usando paralelização
             Parallel.For(0, NUMBER_RANGE, i =>
             {
                 freq[i] /= (double)window.Count;
@@ -247,34 +249,31 @@ namespace Megasena.Enhanced
         /// Calcula a última ocorrência (0..1) de cada número (1..60) na lista.
         ///  - 0 significa que apareceu no sorteio mais recente.
         ///  - 1 significa que não apareceu em nenhum sorteio dessa janela.
-        ///  - 0.5 se apareceu há ~metade da janela, etc.
+        ///  - Valores intermediários indicam a posição relativa da última ocorrência.
         /// </summary>
         private double[] CalculateLastOccurrence(List<MegasenaResult> window)
         {
             // Preenche com o valor "window.Count" (significa que não apareceu)
             double[] lastOcc = Enumerable.Repeat((double)window.Count, NUMBER_RANGE).ToArray();
 
-            // Utilizar Parallel.For para acelerar a iteração
-            Parallel.For(0, window.Count, i =>
+            // Processar cada sorteio e atualizar a última ocorrência
+            for (int i = 0; i < window.Count; i++)
             {
                 var draw = window[i];
                 var numbers = new[] { draw.V1, draw.V2, draw.V3, draw.V4, draw.V5, draw.V6 };
 
                 foreach (var n in numbers)
                 {
-                    // Bloqueia para evitar condições de corrida
-                    // Pode-se usar Interlocked.CompareExchange ou outras técnicas
-                    lock (lastOcc)
+                    // Atualiza apenas se ainda não foi atualizado
+                    if (lastOcc[n - 1] == window.Count)
                     {
-                        if (lastOcc[n - 1] == window.Count)
-                        {
-                            lastOcc[n - 1] = (double)(window.Count - i - 1);
-                        }
+                        // (window.Count - i - 1) representa quantos sorteios atrás apareceu
+                        lastOcc[n - 1] = (double)(window.Count - i - 1);
                     }
                 }
-            });
+            }
 
-            // Normaliza pelo total de sorteios nessa janela
+            // Normaliza pelo total de sorteios nessa janela usando paralelização
             Parallel.For(0, NUMBER_RANGE, i =>
             {
                 lastOcc[i] /= (double)window.Count;
@@ -289,10 +288,10 @@ namespace Megasena.Enhanced
         /// </summary>
         private IMLDataSet PrepareTrainingSet(List<MegasenaResult> fullHistory)
         {
-            var inputList = new List<double[]>();
-            var outputList = new List<double[]>();
+            var inputList = new ConcurrentBag<double[]>();
+            var outputList = new ConcurrentBag<double[]>();
 
-            // Paralelizar a preparação dos dados
+            // Utilizar Parallel.For para acelerar a preparação dos dados
             Parallel.For(_historyWindow, fullHistory.Count, i =>
             {
                 // Seleciona a "janela principal" de i-_historyWindow até i-1
@@ -313,15 +312,16 @@ namespace Megasena.Enhanced
                 outputs[currentDraw.V5 - 1] = 1;
                 outputs[currentDraw.V6 - 1] = 1;
 
-                // Adicionar thread-safe
-                lock (inputList)
-                {
-                    inputList.Add(features);
-                    outputList.Add(outputs);
-                }
+                // Adicionar aos bags de forma thread-safe
+                inputList.Add(features);
+                outputList.Add(outputs);
             });
 
-            return new BasicMLDataSet(inputList.ToArray(), outputList.ToArray());
+            // Converter ConcurrentBag para arrays
+            var inputArray = inputList.ToArray();
+            var outputArray = outputList.ToArray();
+
+            return new BasicMLDataSet(inputArray, outputArray);
         }
 
         /// <summary>
